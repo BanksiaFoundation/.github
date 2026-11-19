@@ -77,7 +77,7 @@ async function graphql(query, variables) {
 }
 
 let writes = 0;
-const counts = { labels: 0, links: 0 };
+const counts = { labels: 0, links: 0, failures: 0 };
 function countWrite() {
   writes += 1;
   if (writes > MAX_WRITES) throw new Error(`stopped after ${MAX_WRITES} writes in one run`);
@@ -141,7 +141,7 @@ const ITEMS = `query($org: String!, $number: Int!, $after: String) {
             body
             blockedBy(first: ${BLOCKERS_READ}) { nodes { id state } }
             closedByPullRequestsReferences(first: ${LINKED_PRS}, includeClosedPrs: true) {
-              nodes { state isDraft } } }
+              nodes { state isDraft authorAssociation } } }
           ... on PullRequest { ${CONTENT} isDraft } } }
       pageInfo { hasNextPage endCursor } } } } }`;
 
@@ -151,7 +151,7 @@ const PROJECT = `query($org: String!, $number: Int!) {
     blocked: field(name: "Blocked") { ... on ProjectV2SingleSelectField { id options { id name } } } } } }`;
 
 const ISSUE_ID = `query($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) { issue(number: $number) { id } } }`;
+  repository(owner: $owner, name: $name) { issue(number: $number) { id state } } }`;
 
 const ADD_BLOCKER = `mutation($issue: ID!, $blocker: ID!) {
   addBlockedBy(input: { issueId: $issue, blockingIssueId: $blocker }) { issue { id } } }`;
@@ -186,7 +186,8 @@ function derivedStatus(content, current) {
   if (content.isDraft === false) return IN_REVIEW;
   /** @type {{ state: string, isDraft: boolean }[]} */
   const open = content.closedByPullRequestsReferences.nodes.filter(
-    (/** @type {{ state: string }} */ pr) => pr.state === "OPEN",
+    (/** @type {{ state: string, authorAssociation: string }} */ pr) =>
+      pr.state === "OPEN" && TRUSTED_AUTHORS.has(pr.authorAssociation),
   );
   if (open.some((pr) => !pr.isDraft)) return IN_REVIEW;
   if (open.length > 0) return IN_PROGRESS;
@@ -244,12 +245,19 @@ async function syncBlockers(content) {
     const [repo, number] = match[1].split("#");
     const [refOwner, refName] = repo ? repo.split("/") : [owner, name];
     if (refOwner.toLowerCase() !== ORG.toLowerCase()) continue;
-    const target = (await graphql(ISSUE_ID, { owner: refOwner, name: refName, number: Number(number) }))
-      .repository?.issue;
-    if (!target || known.has(target.id) || target.id === content.id) continue;
-    await graphql(ADD_BLOCKER, { issue: content.id, blocker: target.id });
-    known.add(target.id);
-    blockers.push({ id: target.id, state: "OPEN" });
+    // A wrong reference, such as a pull request number or a typo, skips that line only.
+    try {
+      const target = (await graphql(ISSUE_ID, { owner: refOwner, name: refName, number: Number(number) }))
+        .repository?.issue;
+      if (!target || known.has(target.id) || target.id === content.id) continue;
+      await graphql(ADD_BLOCKER, { issue: content.id, blocker: target.id });
+      known.add(target.id);
+      blockers.push(target);
+    } catch (error) {
+      if (writes > MAX_WRITES) throw error;
+      counts.failures += 1;
+      continue;
+    }
     counts.links += 1;
   }
   return blockers.some((blocker) => blocker.state === "OPEN");
@@ -288,16 +296,23 @@ for (const item of items) {
   if (!item.content?.id || !TRUSTED_AUTHORS.has(item.content.authorAssociation)) continue;
   const current = item.status?.name ?? TODO;
   const status = derivedStatus(item.content, current);
-  if (status !== current) {
-    const option = optionId.get(status);
-    if (!option) throw new Error(`the Status field has no option named ${status}`);
-    await graphql(SET_STATUS, { project: project.id, item: item.id, field: project.field.id, option });
-    moved += 1;
+  const option = optionId.get(status);
+  if (!option) throw new Error(`the Status field has no option named ${status}`);
+  // One item that fails must not stop the others; the run still ends with an error.
+  try {
+    if (status !== current) {
+      await graphql(SET_STATUS, { project: project.id, item: item.id, field: project.field.id, option });
+      moved += 1;
+    }
+    await setStageLabel(item.content, status);
+    if (item.content.blockedBy) await setBlocked(item, await syncBlockers(item.content));
+  } catch (error) {
+    if (writes > MAX_WRITES) throw error;
+    counts.failures += 1;
   }
-  await setStageLabel(item.content, status);
-  if (item.content.blockedBy) await setBlocked(item, await syncBlockers(item.content));
 }
 console.log(
   `${added} added, ${moved} moved, ${counts.labels} labels changed, ${counts.links} links added, ` +
-    `${items.length} items, ${open.length} open`,
+    `${counts.failures} failed, ${items.length} items, ${open.length} open`,
 );
+if (counts.failures > 0) process.exitCode = 1;
