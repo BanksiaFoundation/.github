@@ -29,8 +29,10 @@ jobs:
         with:
           client-id: ${{ vars.PROJECT_APP_CLIENT_ID }}
           private-key: ${{ secrets.PROJECT_APP_PRIVATE_KEY }}
-          owner: BanksiaFoundation
+          owner: ${{ github.repository_owner }}
           permission-issues: write
+          # Without it, a member whose membership is private looks like an outsider and is skipped.
+          permission-members: read
           permission-pull-requests: write
           permission-organization-projects: write
       - name: Sync the project and the stage labels

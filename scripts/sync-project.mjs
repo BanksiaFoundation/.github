@@ -14,19 +14,28 @@
  * The token needs read access to every repository, write access to issues and pull
  * requests for labels, and write access to the organization's projects. Nothing is
  * removed from the project.
+ *
+ * This repository is public, and so are its Actions logs. The script logs counts only,
+ * never an issue, a pull request or a response body from a private repository. It acts
+ * only on items opened by an owner, a member or a collaborator of the organization.
  */
+import { organization } from "./organization.mjs";
 
 const GRAPHQL = "https://api.github.com/graphql";
 const REST = "https://api.github.com";
-const ORG = process.env.ORG ?? "BanksiaFoundation";
-const PROJECT_NUMBER = Number(process.env.PROJECT_NUMBER ?? "1");
+const ORG = organization();
+const PROJECT_NUMBER = 1;
+const REQUEST_TIMEOUT_MS = 30_000;
+// Stops a run that would write more than a normal run does, such as after a bad change.
+const MAX_WRITES = 500;
+const TRUSTED_AUTHORS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const PAGE_SIZE = 50;
 const LINKED_PRS = 20;
 const LABELS_READ = 50;
 const BLOCKERS_READ = 50;
 const BLOCKED_LABEL = "blocked";
 const BLOCKED_OPTION = "Yes";
-// A line such as "Blocked by #12" or "Depends on BanksiaFoundation/engine#12".
+// A line such as "Blocked by #12" or "Depends on OWNER/REPO#12".
 const DEPENDENCY_LINE = /^\s*[-*]?\s*(?:blocked by|depends on)\s+((?:[\w.-]+\/[\w.-]+)?#\d+)/gim;
 
 const TODO = "Todo";
@@ -51,16 +60,27 @@ function token() {
  * @returns {Promise<any>}
  */
 async function graphql(query, variables) {
+  if (query.trimStart().startsWith("mutation")) countWrite();
   const response = await fetch(GRAPHQL, {
     method: "POST",
     headers: { authorization: `Bearer ${token()}`, "content-type": "application/json" },
     body: JSON.stringify({ query, variables }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
-  const body = await response.json();
-  if (!response.ok || body.errors) {
-    throw new Error(`GitHub answered ${response.status}: ${JSON.stringify(body.errors ?? body)}`);
+  // The error text can name private repositories, so only the status and error types go out.
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.errors || !body.data) {
+    const types = (body.errors ?? []).map((/** @type {{ type?: string }} */ e) => e.type ?? "unknown");
+    throw new Error(`GraphQL request answered ${response.status} ${types.join(",")}`);
   }
   return body.data;
+}
+
+let writes = 0;
+const counts = { labels: 0, links: 0, failures: 0 };
+function countWrite() {
+  writes += 1;
+  if (writes > MAX_WRITES) throw new Error(`stopped after ${MAX_WRITES} writes in one run`);
 }
 
 /**
@@ -69,14 +89,16 @@ async function graphql(query, variables) {
  * @param {unknown} [body]
  */
 async function rest(method, path, body) {
+  countWrite();
   const response = await fetch(`${REST}${path}`, {
     method,
     headers: { authorization: `Bearer ${token()}`, accept: "application/vnd.github+json" },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   // A label that is already gone answers 404, which is the state we want.
   if (!response.ok && !(method === "DELETE" && response.status === 404)) {
-    throw new Error(`${method} ${path} answered ${response.status}: ${await response.text()}`);
+    throw new Error(`REST ${method} answered ${response.status}`);
   }
 }
 
@@ -102,7 +124,7 @@ async function all(query, variables, pick) {
 }
 
 const CONTENT = `
-  id number url state
+  id number state authorAssociation
   repository { nameWithOwner }
   labels(first: ${LABELS_READ}) { nodes { name } }`;
 
@@ -119,7 +141,7 @@ const ITEMS = `query($org: String!, $number: Int!, $after: String) {
             body
             blockedBy(first: ${BLOCKERS_READ}) { nodes { id state } }
             closedByPullRequestsReferences(first: ${LINKED_PRS}, includeClosedPrs: true) {
-              nodes { state isDraft } } }
+              nodes { state isDraft authorAssociation } } }
           ... on PullRequest { ${CONTENT} isDraft } } }
       pageInfo { hasNextPage endCursor } } } } }`;
 
@@ -129,7 +151,7 @@ const PROJECT = `query($org: String!, $number: Int!) {
     blocked: field(name: "Blocked") { ... on ProjectV2SingleSelectField { id options { id name } } } } } }`;
 
 const ISSUE_ID = `query($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) { issue(number: $number) { id } } }`;
+  repository(owner: $owner, name: $name) { issue(number: $number) { id state } } }`;
 
 const ADD_BLOCKER = `mutation($issue: ID!, $blocker: ID!) {
   addBlockedBy(input: { issueId: $issue, blockingIssueId: $blocker }) { issue { id } } }`;
@@ -141,7 +163,7 @@ const CLEAR_FIELD = `mutation($project: ID!, $item: ID!, $field: ID!) {
 // Issue search returns at most 1000 results for one query.
 const OPEN = `query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: ${PAGE_SIZE}, after: $after) {
-    nodes { ... on Issue { id url } ... on PullRequest { id url } }
+    nodes { ... on Issue { id authorAssociation } ... on PullRequest { id authorAssociation } }
     pageInfo { hasNextPage endCursor } } }`;
 
 const ADD = `mutation($project: ID!, $content: ID!) {
@@ -164,7 +186,8 @@ function derivedStatus(content, current) {
   if (content.isDraft === false) return IN_REVIEW;
   /** @type {{ state: string, isDraft: boolean }[]} */
   const open = content.closedByPullRequestsReferences.nodes.filter(
-    (/** @type {{ state: string }} */ pr) => pr.state === "OPEN",
+    (/** @type {{ state: string, authorAssociation: string }} */ pr) =>
+      pr.state === "OPEN" && TRUSTED_AUTHORS.has(pr.authorAssociation),
   );
   if (open.some((pr) => !pr.isDraft)) return IN_REVIEW;
   if (open.length > 0) return IN_PROGRESS;
@@ -183,12 +206,12 @@ async function setStageLabel(content, status) {
   for (const name of have) {
     if (STAGE_LABELS.has(name) && name !== want) {
       await rest("DELETE", `${path}/${encodeURIComponent(name)}`);
-      console.log(`unlabelled ${name} ${content.url}`);
+      counts.labels += 1;
     }
   }
   if (want && !have.includes(want)) {
     await rest("POST", path, { labels: [want] });
-    console.log(`labelled ${want} ${content.url}`);
+    counts.labels += 1;
   }
 }
 
@@ -202,10 +225,9 @@ const held = new Set(before.map((item) => item.content?.id).filter(Boolean));
 const open = await all(OPEN, { q: `org:${ORG} is:open archived:false` }, (data) => data.search);
 let added = 0;
 for (const node of open) {
-  if (!node.id || held.has(node.id)) continue;
+  if (!node.id || held.has(node.id) || !TRUSTED_AUTHORS.has(node.authorAssociation)) continue;
   await graphql(ADD, { project: project.id, content: node.id });
   added += 1;
-  console.log(`added ${node.url}`);
 }
 
 /**
@@ -222,13 +244,21 @@ async function syncBlockers(content) {
   for (const match of String(content.body ?? "").matchAll(DEPENDENCY_LINE)) {
     const [repo, number] = match[1].split("#");
     const [refOwner, refName] = repo ? repo.split("/") : [owner, name];
-    const target = (await graphql(ISSUE_ID, { owner: refOwner, name: refName, number: Number(number) }))
-      .repository?.issue;
-    if (!target || known.has(target.id) || target.id === content.id) continue;
-    await graphql(ADD_BLOCKER, { issue: content.id, blocker: target.id });
-    known.add(target.id);
-    blockers.push({ id: target.id, state: "OPEN" });
-    console.log(`linked ${content.url} blocked by ${match[1]}`);
+    if (refOwner.toLowerCase() !== ORG.toLowerCase()) continue;
+    // A wrong reference, such as a pull request number or a typo, skips that line only.
+    try {
+      const target = (await graphql(ISSUE_ID, { owner: refOwner, name: refName, number: Number(number) }))
+        .repository?.issue;
+      if (!target || known.has(target.id) || target.id === content.id) continue;
+      await graphql(ADD_BLOCKER, { issue: content.id, blocker: target.id });
+      known.add(target.id);
+      blockers.push(target);
+    } catch (error) {
+      if (writes > MAX_WRITES) throw error;
+      counts.failures += 1;
+      continue;
+    }
+    counts.links += 1;
   }
   return blockers.some((blocker) => blocker.state === "OPEN");
 }
@@ -244,10 +274,10 @@ async function setBlocked(item, blocked) {
   const path = `/repos/${content.repository.nameWithOwner}/issues/${content.number}/labels`;
   if (blocked && !have.includes(BLOCKED_LABEL)) {
     await rest("POST", path, { labels: [BLOCKED_LABEL] });
-    console.log(`labelled ${BLOCKED_LABEL} ${content.url}`);
+    counts.labels += 1;
   } else if (!blocked && have.includes(BLOCKED_LABEL)) {
     await rest("DELETE", `${path}/${BLOCKED_LABEL}`);
-    console.log(`unlabelled ${BLOCKED_LABEL} ${content.url}`);
+    counts.labels += 1;
   }
   if (!project.blocked) return;
   const isSet = item.blocked?.name === BLOCKED_OPTION;
@@ -263,17 +293,26 @@ async function setBlocked(item, blocked) {
 const items = added > 0 ? await all(ITEMS, { org: ORG, number: PROJECT_NUMBER }, pickItems) : before;
 let moved = 0;
 for (const item of items) {
-  if (!item.content?.id) continue;
+  if (!item.content?.id || !TRUSTED_AUTHORS.has(item.content.authorAssociation)) continue;
   const current = item.status?.name ?? TODO;
   const status = derivedStatus(item.content, current);
-  if (status !== current) {
-    const option = optionId.get(status);
-    if (!option) throw new Error(`the Status field has no option named ${status}`);
-    await graphql(SET_STATUS, { project: project.id, item: item.id, field: project.field.id, option });
-    moved += 1;
-    console.log(`moved ${current} -> ${status} ${item.content.url}`);
+  const option = optionId.get(status);
+  if (!option) throw new Error(`the Status field has no option named ${status}`);
+  // One item that fails must not stop the others; the run still ends with an error.
+  try {
+    if (status !== current) {
+      await graphql(SET_STATUS, { project: project.id, item: item.id, field: project.field.id, option });
+      moved += 1;
+    }
+    await setStageLabel(item.content, status);
+    if (item.content.blockedBy) await setBlocked(item, await syncBlockers(item.content));
+  } catch (error) {
+    if (writes > MAX_WRITES) throw error;
+    counts.failures += 1;
   }
-  await setStageLabel(item.content, status);
-  if (item.content.blockedBy) await setBlocked(item, await syncBlockers(item.content));
 }
-console.log(`${added} added, ${moved} moved, ${items.length} items, ${open.length} open`);
+console.log(
+  `${added} added, ${moved} moved, ${counts.labels} labels changed, ${counts.links} links added, ` +
+    `${counts.failures} failed, ${items.length} items, ${open.length} open`,
+);
+if (counts.failures > 0) process.exitCode = 1;
