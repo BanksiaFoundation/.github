@@ -19,6 +19,8 @@ The scripts are plain JavaScript for Node 24 with JSDoc types and `// @ts-check`
 
 Status follows the pull requests: a closed issue or a merged or closed pull request is Done, an open pull request in review is In review, a draft pull request is In progress, and an item with no pull request stays where a person put it. A reopened issue on Done goes back to Todo. Each item then carries one stage label: `in-progress`, `in-review` or `done`. Todo carries none.
 
+Each issue form sets the issue type: Bug, Feature or Task. An open issue with no type, such as one opened from the command line, gets one from its title: `fix` is Bug, `feat` is Feature, and any other title is Task. The Bugs view lists bugs, and the Features and tasks view lists everything else.
+
 Dependencies use GitHub's own "blocked by" links, set in an issue's sidebar. A line in an issue body such as `Blocked by #12` or `Depends on OWNER/REPO#12` makes the sync add the link when the repository belongs to this organization, and the sync removes none. An issue with an open blocker gets the `blocked` label and `Yes` in the Blocked field, and both clear when the last blocker closes. The Blocked view lists them.
 
 The workflow needs a GitHub App installed on every repository of the organization, with these permissions: Issues read and write, Pull requests read and write, Organization projects read and write, Members read. Store its client id as the variable `PROJECT_APP_CLIENT_ID` and its private key as the secret `PROJECT_APP_PRIVATE_KEY` in this repository.
