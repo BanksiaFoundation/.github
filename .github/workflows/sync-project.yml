@@ -29,7 +29,7 @@ jobs:
         with:
           client-id: ${{ vars.PROJECT_APP_CLIENT_ID }}
           private-key: ${{ secrets.PROJECT_APP_PRIVATE_KEY }}
-          owner: BanksiaFoundation
+          owner: ${{ github.repository_owner }}
           permission-issues: write
           permission-pull-requests: write
           permission-organization-projects: write
