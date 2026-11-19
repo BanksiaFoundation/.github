@@ -7,7 +7,10 @@
  * 2. moves an item's Status from its pull requests, and leaves an item with no pull
  *    request where a person put it;
  * 3. puts the stage label of each item's Status on the issue or pull request and takes
- *    the other stage labels off.
+ *    the other stage labels off;
+ * 4. turns a "Blocked by #N" or "Depends on OWNER/REPO#N" line in an issue body into a
+ *    GitHub dependency, and marks an issue with an open blocker with the `blocked` label
+ *    and the Blocked field.
  * The token needs read access to every repository, write access to issues and pull
  * requests for labels, and write access to the organization's projects. Nothing is
  * removed from the project.
@@ -20,6 +23,11 @@ const PROJECT_NUMBER = Number(process.env.PROJECT_NUMBER ?? "1");
 const PAGE_SIZE = 50;
 const LINKED_PRS = 20;
 const LABELS_READ = 50;
+const BLOCKERS_READ = 50;
+const BLOCKED_LABEL = "blocked";
+const BLOCKED_OPTION = "Yes";
+// A line such as "Blocked by #12" or "Depends on BanksiaFoundation/engine#12".
+const DEPENDENCY_LINE = /^\s*[-*]?\s*(?:blocked by|depends on)\s+((?:[\w.-]+\/[\w.-]+)?#\d+)/gim;
 
 const TODO = "Todo";
 const IN_PROGRESS = "In progress";
@@ -104,8 +112,12 @@ const ITEMS = `query($org: String!, $number: Int!, $after: String) {
       nodes { id
         status: fieldValueByName(name: "Status") {
           ... on ProjectV2ItemFieldSingleSelectValue { name } }
+        blocked: fieldValueByName(name: "Blocked") {
+          ... on ProjectV2ItemFieldSingleSelectValue { name } }
         content {
           ... on Issue { ${CONTENT}
+            body
+            blockedBy(first: ${BLOCKERS_READ}) { nodes { id state } }
             closedByPullRequestsReferences(first: ${LINKED_PRS}, includeClosedPrs: true) {
               nodes { state isDraft } } }
           ... on PullRequest { ${CONTENT} isDraft } } }
@@ -113,7 +125,18 @@ const ITEMS = `query($org: String!, $number: Int!, $after: String) {
 
 const PROJECT = `query($org: String!, $number: Int!) {
   organization(login: $org) { projectV2(number: $number) { id
-    field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } } } } }`;
+    field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } }
+    blocked: field(name: "Blocked") { ... on ProjectV2SingleSelectField { id options { id name } } } } } }`;
+
+const ISSUE_ID = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { issue(number: $number) { id } } }`;
+
+const ADD_BLOCKER = `mutation($issue: ID!, $blocker: ID!) {
+  addBlockedBy(input: { issueId: $issue, blockingIssueId: $blocker }) { issue { id } } }`;
+
+const CLEAR_FIELD = `mutation($project: ID!, $item: ID!, $field: ID!) {
+  clearProjectV2ItemFieldValue(input: { projectId: $project, itemId: $item, fieldId: $field }) {
+    projectV2Item { id } } }`;
 
 // Issue search returns at most 1000 results for one query.
 const OPEN = `query($q: String!, $after: String) {
@@ -185,6 +208,58 @@ for (const node of open) {
   console.log(`added ${node.url}`);
 }
 
+/**
+ * Adds the dependencies an issue body names and returns whether an open issue blocks it.
+ *
+ * @param {any} content an Issue
+ * @returns {Promise<boolean>}
+ */
+async function syncBlockers(content) {
+  /** @type {{ id: string, state: string }[]} */
+  const blockers = [...content.blockedBy.nodes];
+  const known = new Set(blockers.map((blocker) => blocker.id));
+  const [owner, name] = content.repository.nameWithOwner.split("/");
+  for (const match of String(content.body ?? "").matchAll(DEPENDENCY_LINE)) {
+    const [repo, number] = match[1].split("#");
+    const [refOwner, refName] = repo ? repo.split("/") : [owner, name];
+    const target = (await graphql(ISSUE_ID, { owner: refOwner, name: refName, number: Number(number) }))
+      .repository?.issue;
+    if (!target || known.has(target.id) || target.id === content.id) continue;
+    await graphql(ADD_BLOCKER, { issue: content.id, blocker: target.id });
+    known.add(target.id);
+    blockers.push({ id: target.id, state: "OPEN" });
+    console.log(`linked ${content.url} blocked by ${match[1]}`);
+  }
+  return blockers.some((blocker) => blocker.state === "OPEN");
+}
+
+/**
+ * @param {any} item
+ * @param {boolean} blocked
+ */
+async function setBlocked(item, blocked) {
+  const content = item.content;
+  /** @type {string[]} */
+  const have = content.labels.nodes.map((/** @type {{ name: string }} */ label) => label.name);
+  const path = `/repos/${content.repository.nameWithOwner}/issues/${content.number}/labels`;
+  if (blocked && !have.includes(BLOCKED_LABEL)) {
+    await rest("POST", path, { labels: [BLOCKED_LABEL] });
+    console.log(`labelled ${BLOCKED_LABEL} ${content.url}`);
+  } else if (!blocked && have.includes(BLOCKED_LABEL)) {
+    await rest("DELETE", `${path}/${BLOCKED_LABEL}`);
+    console.log(`unlabelled ${BLOCKED_LABEL} ${content.url}`);
+  }
+  if (!project.blocked) return;
+  const isSet = item.blocked?.name === BLOCKED_OPTION;
+  if (blocked && !isSet) {
+    const option = project.blocked.options.find((/** @type {{ name: string }} */ o) => o.name === BLOCKED_OPTION);
+    if (!option) throw new Error(`the Blocked field has no option named ${BLOCKED_OPTION}`);
+    await graphql(SET_STATUS, { project: project.id, item: item.id, field: project.blocked.id, option: option.id });
+  } else if (!blocked && isSet) {
+    await graphql(CLEAR_FIELD, { project: project.id, item: item.id, field: project.blocked.id });
+  }
+}
+
 const items = added > 0 ? await all(ITEMS, { org: ORG, number: PROJECT_NUMBER }, pickItems) : before;
 let moved = 0;
 for (const item of items) {
@@ -199,5 +274,6 @@ for (const item of items) {
     console.log(`moved ${current} -> ${status} ${item.content.url}`);
   }
   await setStageLabel(item.content, status);
+  if (item.content.blockedBy) await setBlocked(item, await syncBlockers(item.content));
 }
 console.log(`${added} added, ${moved} moved, ${items.length} items, ${open.length} open`);

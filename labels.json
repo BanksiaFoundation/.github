@@ -158,5 +158,10 @@
     "name": "done",
     "color": "0e8a16",
     "description": "Board Status: Done"
+  },
+  {
+    "name": "blocked",
+    "color": "b60205",
+    "description": "An open issue blocks this one"
   }
 ]
