@@ -147,11 +147,16 @@
   {
     "name": "in-progress",
     "color": "fbca04",
-    "description": "A linked pull request is open"
+    "description": "Board Status: In progress"
   },
   {
-    "name": "merged",
+    "name": "in-review",
+    "color": "1d76db",
+    "description": "Board Status: In review"
+  },
+  {
+    "name": "done",
     "color": "0e8a16",
-    "description": "A linked pull request has merged"
+    "description": "Board Status: Done"
   }
 ]
