@@ -1,6 +1,7 @@
 name: Task
 description: Plan a piece of work, such as a refactor, a docs change or a CI change.
 title: "docs: "
+type: Task
 body:
   - type: textarea
     id: what

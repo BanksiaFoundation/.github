@@ -2,13 +2,15 @@
 /**
  * Keeps the organization project and the stage labels in step.
  *
- * Usage: GH_TOKEN=... node scripts/sync-project.mjs. Each run does three things:
+ * Usage: GH_TOKEN=... node scripts/sync-project.mjs. Each run:
  * 1. adds every open issue and pull request of the organization to the project;
  * 2. moves an item's Status from its pull requests, and leaves an item with no pull
  *    request where a person put it;
  * 3. puts the stage label of each item's Status on the issue or pull request and takes
  *    the other stage labels off;
- * 4. turns a "Blocked by #N" or "Depends on OWNER/REPO#N" line in an issue body into a
+ * 4. gives an issue with no issue type one from its title: `fix` is Bug, `feat` is Feature,
+ *    and any other title is Task;
+ * 5. turns a "Blocked by #N" or "Depends on OWNER/REPO#N" line in an issue body into a
  *    GitHub dependency, and marks an issue with an open blocker with the `blocked` label
  *    and the Blocked field.
  * The token needs read access to every repository, write access to issues and pull
@@ -33,6 +35,7 @@ const PAGE_SIZE = 50;
 const LINKED_PRS = 20;
 const LABELS_READ = 50;
 const BLOCKERS_READ = 50;
+const ISSUE_TYPES_READ = 25;
 const BLOCKED_LABEL = "blocked";
 const BLOCKED_OPTION = "Yes";
 // A line such as "Blocked by #12" or "Depends on OWNER/REPO#12".
@@ -77,7 +80,7 @@ async function graphql(query, variables) {
 }
 
 let writes = 0;
-const counts = { labels: 0, links: 0, failures: 0 };
+const counts = { labels: 0, links: 0, types: 0, failures: 0 };
 function countWrite() {
   writes += 1;
   if (writes > MAX_WRITES) throw new Error(`stopped after ${MAX_WRITES} writes in one run`);
@@ -138,12 +141,33 @@ const ITEMS = `query($org: String!, $number: Int!, $after: String) {
           ... on ProjectV2ItemFieldSingleSelectValue { name } }
         content {
           ... on Issue { ${CONTENT}
-            body
+            body title
+            issueType { name }
             blockedBy(first: ${BLOCKERS_READ}) { nodes { id state } }
             closedByPullRequestsReferences(first: ${LINKED_PRS}, includeClosedPrs: true) {
               nodes { state isDraft authorAssociation } } }
           ... on PullRequest { ${CONTENT} isDraft } } }
       pageInfo { hasNextPage endCursor } } } } }`;
+
+const ISSUE_TYPES = `query($org: String!) {
+  organization(login: $org) { issueTypes(first: ${ISSUE_TYPES_READ}) { nodes { id name } } } }`;
+
+const SET_ISSUE_TYPE = `mutation($issue: ID!, $type: ID!) {
+  updateIssue(input: { id: $issue, issueTypeId: $type }) { issue { id } } }`;
+
+// A Conventional Commits title: the type, an optional scope, an optional "!", then ":".
+const BUG_TITLE = /^fix(\([^)]*\))?!?:/i;
+const FEATURE_TITLE = /^feat(\([^)]*\))?!?:/i;
+
+/**
+ * @param {string} title
+ * @returns {string}
+ */
+function issueTypeOf(title) {
+  if (BUG_TITLE.test(title)) return "Bug";
+  if (FEATURE_TITLE.test(title)) return "Feature";
+  return "Task";
+}
 
 const PROJECT = `query($org: String!, $number: Int!) {
   organization(login: $org) { projectV2(number: $number) { id
@@ -218,6 +242,16 @@ async function setStageLabel(content, status) {
 const project = (await graphql(PROJECT, { org: ORG, number: PROJECT_NUMBER })).organization.projectV2;
 /** @type {Map<string, string>} */
 const optionId = new Map(project.field.options.map((/** @type {{ id: string, name: string }} */ o) => [o.name, o.id]));
+/** @type {Map<string, string>} */
+const issueTypeId = new Map();
+// Without the issue types the run still syncs the rest and sets no type.
+try {
+  for (const t of (await graphql(ISSUE_TYPES, { org: ORG })).organization.issueTypes.nodes) {
+    issueTypeId.set(t.name, t.id);
+  }
+} catch {
+  counts.failures += 1;
+}
 const pickItems = (/** @type {any} */ data) => data.organization.projectV2.items;
 
 const before = await all(ITEMS, { org: ORG, number: PROJECT_NUMBER }, pickItems);
@@ -305,6 +339,11 @@ for (const item of items) {
       moved += 1;
     }
     await setStageLabel(item.content, status);
+    const type = issueTypeId.get(issueTypeOf(item.content.title ?? ""));
+    if (item.content.blockedBy && !item.content.issueType && item.content.state === "OPEN" && type) {
+      await graphql(SET_ISSUE_TYPE, { issue: item.content.id, type });
+      counts.types += 1;
+    }
     if (item.content.blockedBy) await setBlocked(item, await syncBlockers(item.content));
   } catch (error) {
     if (writes > MAX_WRITES) throw error;
@@ -312,7 +351,8 @@ for (const item of items) {
   }
 }
 console.log(
-  `${added} added, ${moved} moved, ${counts.labels} labels changed, ${counts.links} links added, ` +
+  `${added} added, ${moved} moved, ${counts.labels} labels changed, ` +
+    `${counts.links} links added, ${counts.types} types set, ` +
     `${counts.failures} failed, ${items.length} items, ${open.length} open`,
 );
 if (counts.failures > 0) process.exitCode = 1;
