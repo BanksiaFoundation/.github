@@ -1,0 +1,32 @@
+# Labels every BanksiaFoundation repository carries. scripts/sync-labels.py creates or updates them and deletes none.
+- {name: feat, color: a2eeef, description: New feature}
+- {name: fix, color: d73a4a, description: Bug fix}
+- {name: docs, color: 0075ca, description: Documentation change}
+- {name: test, color: bfd4f2, description: Test changes}
+- {name: refactor, color: fef2c0, description: Code refactoring}
+- {name: perf, color: f9d0c4, description: Performance improvement}
+- {name: ci, color: e6e6e6, description: CI/CD changes}
+- {name: chore, color: ededed, description: Maintenance}
+- {name: breaking, color: b60205, description: Breaking change}
+- {name: dependencies, color: 0366d6, description: Dependency updates}
+- {name: "size:xs", color: ededed, description: Tiny change (1-9 lines)}
+- {name: "size:s", color: bfd4f2, description: Small change (10-49 lines)}
+- {name: "size:m", color: fef2c0, description: Medium change (50-249 lines)}
+- {name: "size:l", color: f9d0c4, description: Large change (250-999 lines)}
+- {name: "size:xl", color: b60205, description: Very large change (1000+ lines)}
+- {name: bug, color: d73a4a, description: "Something isn't working"}
+- {name: enhancement, color: a2eeef, description: New feature or request}
+- {name: question, color: d876e3, description: Further information is requested}
+- {name: duplicate, color: cfd3d7, description: This issue or pull request already exists}
+- {name: invalid, color: e4e669, description: "This doesn't seem right"}
+- {name: wontfix, color: ffffff, description: This will not be worked on}
+- {name: good first issue, color: 7057ff, description: Good for newcomers}
+- {name: help wanted, color: "008672", description: Extra attention is needed}
+- {name: backlog, color: c5def5, description: Deferred idea, not yet scoped or started}
+- {name: design, color: c5def5, description: Needs a design or ADR first}
+- {name: quick-win, color: 0e8a16, description: Small and low risk}
+- {name: later, color: ededed, description: Not for the next release}
+- {name: keep-open, color: 0e8a16, description: Exempt from automated close until a person removes the label}
+- {name: superseded, color: ededed, description: Replaced by another issue or pull request}
+- {name: in-progress, color: fbca04, description: A linked pull request is open}
+- {name: merged, color: 0e8a16, description: A linked pull request has merged}

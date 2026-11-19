@@ -1,0 +1,28 @@
+name: Task
+description: Plan a piece of work, such as a refactor, a docs change or a CI change.
+title: "docs: "
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: What the work changes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What breaks or stays broken without it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: One line each. A reviewer can check each one.
+      placeholder: "- ..."
+    validations:
+      required: true
